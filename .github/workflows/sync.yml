@@ -1,0 +1,40 @@
+name: Synchronizacja LaBalancia -> Shopify
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # co 5 minut (GitHub potrafi opóźnić start o kilka minut)
+  workflow_dispatch:         # ręczne uruchomienie z zakładki Actions
+    inputs:
+      dry_run:
+        description: 'Tylko próba (bez zmian w sklepie)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: shop-refresher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Synchronizuj stany
+        run: node sync.mjs
+        env:
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          SHOPIFY_STORE: ${{ vars.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          FEED_URL: ${{ secrets.FEED_URL }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          STOCK_BUFFER: ${{ vars.STOCK_BUFFER }}

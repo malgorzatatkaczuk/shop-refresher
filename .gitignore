@@ -1,0 +1,8 @@
+# Nigdy nie wrzucaj do repozytorium danych ani kluczy - repo jest publiczne!
+*.xml
+*.json
+!package.json
+.env
+.env.*
+node_modules/
+.DS_Store
