@@ -11,7 +11,7 @@
 //
 // Bez zależności - wymaga Node.js 20+.
 
-import { createSign } from 'node:crypto';
+import { createSign, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 const env = process.env;
@@ -37,6 +37,20 @@ function parsePrice(v) {
   const n = Number(s);
   return Number.isFinite(n) && n > 0 ? n.toFixed(2) : null;
 }
+// Ponawia zapytanie przy chwilowych problemach (sieć, przeciążenie, błędy 5xx/429).
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function fetchRetry(url, opts = {}, tries = 4) {
+  for (let i = 1; ; i++) {
+    try {
+      const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000) });
+      if ((res.status === 429 || res.status >= 500) && i < tries) { await sleep(1500 * i); continue; }
+      return res;
+    } catch (e) {
+      if (i >= tries) throw e;
+      await sleep(1500 * i);
+    }
+  }
+}
 function need(name) {
   if (!env[name]) throw new Error(`Brak zmiennej środowiskowej ${name}`);
   return env[name];
@@ -55,7 +69,7 @@ async function googleToken() {
     exp: now + 3600,
   })}`;
   const sig = createSign('RSA-SHA256').update(unsigned).sign(sa.private_key, 'base64url');
-  const res = await fetch('https://oauth2.googleapis.com/token', {
+  const res = await fetchRetry('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: `${unsigned}.${sig}` }),
@@ -69,7 +83,7 @@ async function readSheetRows() {
   if (env.SHEET_JSON_FILE) return JSON.parse(await readFile(env.SHEET_JSON_FILE, 'utf8')); // test lokalny
   const token = await googleToken();
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${need('SHEET_ID')}/values/${encodeURIComponent(SHEET_RANGE)}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${token}` } });
   const j = await res.json();
   if (!res.ok) throw new Error(`Google Sheets: ${res.status} ${JSON.stringify(j.error || j)}`);
   return j.values || [];
@@ -102,7 +116,7 @@ const tag = (xml, name) => {
 async function readFeed() {
   const xml = env.FEED_FILE
     ? await readFile(env.FEED_FILE, 'utf8')
-    : await fetch(need('FEED_URL')).then((r) => {
+    : await fetchRetry(need('FEED_URL')).then((r) => {
         if (!r.ok) throw new Error(`Feed XML: HTTP ${r.status}`);
         return r.text();
       });
@@ -134,7 +148,7 @@ let shopifyToken = env.SHOPIFY_TOKEN;
 async function getShopifyToken() {
   if (shopifyToken) return shopifyToken;
   // Aplikacja z Dev Dashboard: token z client credentials (ważny ok. 24 h)
-  const res = await fetch(`https://${need('SHOPIFY_STORE')}/admin/oauth/access_token`, {
+  const res = await fetchRetry(`https://${need('SHOPIFY_STORE')}/admin/oauth/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -148,13 +162,15 @@ async function getShopifyToken() {
   return (shopifyToken = j.access_token);
 }
 
-async function gql(query, variables = {}) {
-  const res = await fetch(`https://${need('SHOPIFY_STORE')}/admin/api/${API_VERSION}/graphql.json`, {
+async function gql(query, variables = {}, attempt = 1) {
+  const res = await fetchRetry(`https://${need('SHOPIFY_STORE')}/admin/api/${API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': await getShopifyToken() },
     body: JSON.stringify({ query, variables }),
   });
   const j = await res.json();
+  const throttled = (j.errors || []).some((e) => e?.extensions?.code === 'THROTTLED');
+  if (throttled && attempt < 4) { await sleep(2000 * attempt); return gql(query, variables, attempt + 1); }
   if (j.errors) throw new Error(`Shopify: ${JSON.stringify(j.errors)}`);
   const ue = Object.values(j.data || {}).flatMap((v) => v?.userErrors || []);
   if (ue.length) throw new Error(`Shopify: ${JSON.stringify(ue)}`);
@@ -234,14 +250,14 @@ async function updateProduct(item, feed, productId, locationId) {
     const sv = bySku.get(fv.sku);
     if (!sv) { newVariants.push({ fv, target }); continue; }
     const current = sv.inventoryItem.inventoryLevel?.quantities?.[0]?.quantity;
-    if (current !== target) setQty.push({ inventoryItemId: sv.inventoryItem.id, locationId, quantity: target, changeFromQuantity: current ?? null, label: `${fv.size}: ${current ?? '-'} -> ${target}` });
+    if (current !== target) setQty.push({ inventoryItemId: sv.inventoryItem.id, locationId, quantity: target, changeFromQuantity: null, label: `${fv.size}: ${current ?? '-'} -> ${target}` });
     if (item.price && sv.price !== item.price) priceUpdates.push({ id: sv.id, price: item.price, label: `${fv.size}: ${sv.price} -> ${item.price}` });
   }
   // rozmiary, których nie ma już w feedzie -> 0
   for (const sv of bySku.values()) {
     if (feedSkus.has(sv.sku)) continue;
     const current = sv.inventoryItem.inventoryLevel?.quantities?.[0]?.quantity;
-    if (current && current !== 0) setQty.push({ inventoryItemId: sv.inventoryItem.id, locationId, quantity: 0, changeFromQuantity: current, label: `${sv.title}: ${current} -> 0 (brak w feedzie)` });
+    if (current && current !== 0) setQty.push({ inventoryItemId: sv.inventoryItem.id, locationId, quantity: 0, changeFromQuantity: null, label: `${sv.title}: ${current} -> 0 (brak w feedzie)` });
   }
 
   if (!setQty.length && !priceUpdates.length && !newVariants.length) return log(`  = bez zmian`);
@@ -252,9 +268,10 @@ async function updateProduct(item, feed, productId, locationId) {
 
   if (setQty.length) {
     await gql(
-      `mutation($input: InventorySetQuantitiesInput!) { inventorySetQuantities(input: $input) { userErrors { field message } } }`,
+      `mutation($input: InventorySetQuantitiesInput!, $key: String!) { inventorySetQuantities(input: $input) @idempotent(key: $key) { userErrors { field message } } }`,
       { input: { name: 'available', reason: 'correction',
-        quantities: setQty.map(({ inventoryItemId, locationId: l, quantity, changeFromQuantity }) => ({ inventoryItemId, locationId: l, quantity, changeFromQuantity })) } },
+        quantities: setQty.map(({ inventoryItemId, locationId: l, quantity, changeFromQuantity }) => ({ inventoryItemId, locationId: l, quantity, changeFromQuantity })) },
+        key: randomUUID() },
     );
   }
   if (priceUpdates.length) {
